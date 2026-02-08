@@ -41,24 +41,40 @@ OPENSKY_CLIENT_SECRET = os.environ.get("OPENSKY_CLIENT_SECRET", "")
 # Middle East bounding box for aircraft queries
 ME_BBOX = {"lamin": 12, "lamax": 42, "lomin": 25, "lomax": 70}
 
-# Military callsign prefixes (US military airlift, tanker, bomber, ISR)
+# Military callsign prefixes (US/NATO airlift, tanker, bomber, ISR, fighter)
 MIL_PREFIXES = [
-    "RCH", "REACH",  # C-17/C-5 airlift
-    "DOOM", "DEATH",  # B-2/B-52 bombers
-    "IRON",           # Various military
-    "HAVOC",          # Attack aviation
-    "KING",           # HC-130 CSAR
-    "ETHYL",          # KC-135 tanker
-    "JULIET",         # KC-10 tanker
-    "HOMER",          # P-8 Poseidon
-    "TOPCT",          # RC-135
-    "JAKE",           # E-3 AWACS
-    "TITAN",          # RQ-4 Global Hawk
-    "EVAC",           # Medical evacuation
-    "SAM",            # VIP transport
-    "PACK",           # C-17
-    "DUKE",           # C-17
+    # US Airlift (C-17, C-5, C-130)
+    "RCH", "REACH", "PACK", "DUKE", "MOOSE", "FRED",
+    "CARGO", "HERK", "HERKY",
+    # US Tanker (KC-135, KC-46, KC-10)
+    "ETHYL", "JULIET", "PEARL", "STEEL", "SHELL",
+    "TEAL", "BRIT", "NKAC", "PKSN",
+    # US Bomber (B-2, B-52, B-1)
+    "DOOM", "DEATH", "BATT", "SEVILLE", "MYTEE",
+    "BONE", "LANCE", "TIGER",
+    # US ISR / SIGINT / AWACS
+    "HOMER", "TOPCT", "JAKE", "TITAN", "FORTE",
+    "MAGIC", "SNTRY", "REDEYE", "RAIDR", "OLIVE",
+    "MAZDA", "TANGO", "NCHO",
+    # US Fighter / Strike
+    "VIPER", "EAGLE", "HAWK", "RAZOR", "STRIKE",
+    "TREND", "RAGE", "BOLT", "WRATH",
+    # US CSAR / Medevac / Special
+    "KING", "EVAC", "PEDRO", "JOLLY", "DUSTOFF",
+    # US VIP / Command
+    "SAM", "VENUS", "EXEC", "SPAR", "IRON",
+    # US Navy / Marine
+    "NAVY", "HAVOC", "CONDOR",
+    # UK RAF
+    "ASCOT", "TARTN", "RRR",
+    # Other NATO / Coalition
+    "GAF", "FAF", "IAM", "BAF", "DAF",
+    # Generic military patterns
+    "GOLD", "SHADOW", "TORCH",
 ]
+
+# Also detect military by origin country (US, UK) + non-standard callsigns
+MIL_COUNTRIES = ["United States", "United Kingdom"]
 
 # Polymarket event slugs for Iran-related markets
 POLYMARKET_IRAN_SLUGS = [
@@ -126,14 +142,23 @@ def fetch_opensky():
         all_aircraft = data.get("states", []) or []
         mil_aircraft = []
 
-        for s in all_aircraft:
-            callsign = (s[1] or "").strip().upper()
-            origin = s[2] or ""
-            on_ground = s[8]
-            lat, lon = s[6], s[5]
-            alt_m = s[7]
+        for ac in all_aircraft:
+            callsign = (ac[1] or "").strip().upper()
+            origin = ac[2] or ""
+            on_ground = ac[8]
+            lat, lon = ac[6], ac[5]
+            alt_m = ac[7]
 
+            # Match by callsign prefix
             is_mil = any(callsign.startswith(p) for p in MIL_PREFIXES)
+
+            # Also flag US/UK aircraft with non-commercial callsign patterns
+            # Commercial flights are typically 2-3 letter airline code + numbers (e.g., UAL123)
+            if not is_mil and origin in MIL_COUNTRIES and callsign:
+                # Military callsigns often have letters mixed in or are all-alpha
+                has_no_digits = not any(c.isdigit() for c in callsign[:3])
+                if has_no_digits and len(callsign) >= 4:
+                    is_mil = True
 
             if is_mil and not on_ground:
                 mil_aircraft.append({
@@ -164,27 +189,42 @@ def fetch_polymarket():
     url = "https://gamma-api.polymarket.com/events"
 
     try:
-        # Search by tag
-        resp = requests.get(url, params={
-            "tag": "iran", "active": "true", "closed": "false", "limit": 30
-        }, timeout=15)
-        resp.raise_for_status()
-        events = resp.json()
-
+        # Search by tag — cast a wide net
         markets = []
-        for ev in events:
-            for m in ev.get("markets", []):
-                q = (m.get("question") or "").lower()
-                if any(kw in q for kw in ["strike", "attack", "military", "khamenei", "regime", "war"]):
-                    prices = json.loads(m.get("outcomePrices", "[]"))
-                    yes_price = round(float(prices[0]) * 100) if prices else None
-                    if yes_price is not None:
-                        markets.append({
-                            "question": m.get("question", ""),
-                            "probability": yes_price,
-                            "volume": m.get("volume", "0"),
-                            "url": f"https://polymarket.com/event/{ev.get('slug', '')}",
-                        })
+        for tag in ["iran", "middle-east", "geopolitics"]:
+            try:
+                resp = requests.get(url, params={
+                    "tag": tag, "active": "true", "closed": "false", "limit": 50
+                }, timeout=15)
+                resp.raise_for_status()
+                events = resp.json()
+
+                for ev in events:
+                    for m in ev.get("markets", []):
+                        q = (m.get("question") or "").lower()
+                        # Include any market mentioning Iran or related topics
+                        if any(kw in q for kw in [
+                            "iran", "tehran", "khamenei", "irgc", "fordow", "natanz",
+                            "strike", "centcom", "persian gulf", "strait of hormuz",
+                            "arabian sea", "nuclear", "enrichment", "regime change"
+                        ]):
+                            prices = json.loads(m.get("outcomePrices", "[]"))
+                            yes_price = round(float(prices[0]) * 100) if prices else None
+                            if yes_price is not None:
+                                mid = m.get("id", "")
+                                # Avoid duplicates
+                                if not any(x["question"] == m.get("question") for x in markets):
+                                    markets.append({
+                                        "question": m.get("question", ""),
+                                        "probability": yes_price,
+                                        "volume": m.get("volume", "0"),
+                                        "url": f"https://polymarket.com/event/{ev.get('slug', '')}",
+                                    })
+            except Exception:
+                pass  # Continue with next tag
+
+        # Sort by volume (most liquid markets first)
+        markets.sort(key=lambda x: float(x.get("volume", 0)), reverse=True)
 
         print(f"[Polymarket] Found {len(markets)} Iran-related markets")
         return {"status": "ok", "markets": markets[:10]}
@@ -596,6 +636,26 @@ table.pt{width:100%;border-collapse:collapse}
 .bar{position:fixed;bottom:0;left:0;right:0;background:var(--bg-card);border-top:1px solid var(--border);padding:8px 32px;display:flex;align-items:center;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);z-index:100}
 @media(max-width:900px){.grid{grid-template-columns:1fr}header{padding:16px;flex-wrap:wrap;gap:12px}.wrap{padding:16px}}
 ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg-primary)}::-webkit-scrollbar-thumb{background:var(--border-accent);border-radius:3px}
+.how-btn{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-secondary);background:rgba(30,36,51,0.6);border:1px solid var(--border);border-radius:4px;padding:7px 14px;cursor:pointer;transition:all 0.2s;display:inline-flex;align-items:center;gap:6px}
+.how-btn:hover{color:var(--accent-cyan);border-color:var(--accent-cyan);background:rgba(64,200,232,0.06)}
+.how-btn svg{flex-shrink:0}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;pointer-events:none;transition:opacity 0.2s}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;max-width:560px;width:90%;transform:translateY(10px);transition:transform 0.2s}
+.modal-overlay.open .modal{transform:translateY(0)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:18px 24px;border-bottom:1px solid var(--border)}
+.modal-title{font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--accent-cyan);display:flex;align-items:center;gap:8px}
+.modal-close{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:18px;padding:4px 8px;border-radius:3px}
+.modal-close:hover{color:var(--text-primary);background:var(--bg-elevated)}
+.modal-body{padding:20px 24px 24px}
+.modal-body p{font-size:13.5px;line-height:1.7;color:var(--text-secondary);margin-bottom:16px}
+.modal-body p:last-child{margin-bottom:0}
+.source-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}
+.source-item{background:var(--bg-elevated);border-radius:4px;padding:10px 12px;display:flex;align-items:center;gap:8px}
+.source-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.source-name{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-secondary)}
+.source-what{font-size:10px;color:var(--text-muted)}
+.modal-footer{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);padding:12px 24px;border-top:1px solid var(--border);text-align:center;letter-spacing:0.5px}
 </style>
 </head>
 <body>
@@ -603,9 +663,27 @@ table.pt{width:100%;border-collapse:collapse}
   <div class="hdr-left">
     <div class="logo"><span class="logo-dot"></span>IRAN WATCH</div>
     <span class="subtitle">Open-Source Force Posture Monitor</span>
+    <button class="how-btn" onclick="document.getElementById('howModal').classList.add('open')"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>How do I work?</button>
   </div>
   <div class="ts"><strong>{{DATE_STR}} · {{TIME_STR}}</strong>Auto-updates daily at 0500 GMT</div>
 </header>
+<div class="modal-overlay" id="howModal" onclick="if(event.target===this)this.classList.remove('open')">
+<div class="modal">
+<div class="modal-header"><div class="modal-title"><svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>How Iran Watch Works</div><button class="modal-close" onclick="document.getElementById('howModal').classList.remove('open')">&#10005;</button></div>
+<div class="modal-body">
+<p>Every morning at <strong style="color:var(--text-primary)">5:00 AM GMT</strong>, a script automatically collects data from public sources, sends it to an AI model for analysis, and publishes this page. No human edits the content — it's generated fresh each day.</p>
+<div class="source-grid">
+<div class="source-item"><div class="source-dot" style="background:var(--accent-cyan)"></div><div><div class="source-name">OpenSky Network</div><div class="source-what">Military aircraft tracking</div></div></div>
+<div class="source-item"><div class="source-dot" style="background:var(--accent-amber)"></div><div><div class="source-name">Polymarket</div><div class="source-what">Prediction market odds</div></div></div>
+<div class="source-item"><div class="source-dot" style="background:var(--accent-blue)"></div><div><div class="source-name">Metaculus</div><div class="source-what">Forecaster consensus</div></div></div>
+<div class="source-item"><div class="source-dot" style="background:var(--accent-red)"></div><div><div class="source-name">CENTCOM / DoD</div><div class="source-what">Official military releases</div></div></div>
+</div>
+<p>The AI reads this data and produces an intelligence-style briefing: a <strong style="color:var(--text-primary)">threat level</strong>, a <strong style="color:var(--text-primary)">key judgment</strong> with confidence level, a summary of <strong style="color:var(--text-primary)">what changed overnight</strong>, and a snapshot of where <strong style="color:var(--text-primary)">prediction markets</strong> stand.</p>
+<p style="color:var(--text-muted);font-size:12px">&#9888; This is an automated OSINT tool, not professional intelligence. Military aircraft often fly without transponders. Prediction markets reflect betting sentiment, not ground truth. Always cross-reference.</p>
+</div>
+<div class="modal-footer">Built with OpenSky · Polymarket · Claude AI · GitHub Actions</div>
+</div>
+</div>
 <main class="wrap">
 
 <div class="threat {{THREAT_LEVEL_LOWER}}">
