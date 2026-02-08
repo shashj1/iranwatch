@@ -22,6 +22,7 @@ COST: Claude Haiku 4.5 costs roughly $0.01-0.03 per daily update.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -76,6 +77,88 @@ MIL_PREFIXES = [
 # Also detect military by origin country (US, UK) + non-standard callsigns
 MIL_COUNTRIES = ["United States", "United Kingdom"]
 
+# Callsign prefix → probable airframe and role
+# Sources: OSINT community databases, ADS-B Exchange, milaircomms.com
+CALLSIGN_AIRFRAMES = {
+    # Airlift
+    "RCH":    ("C-17A Globemaster III", "Strategic airlift"),
+    "REACH":  ("C-17A Globemaster III", "Strategic airlift"),
+    "PACK":   ("C-17A Globemaster III", "Strategic airlift"),
+    "DUKE":   ("C-17A Globemaster III", "Strategic airlift"),
+    "MOOSE":  ("C-5M Super Galaxy", "Heavy airlift"),
+    "FRED":   ("C-5M Super Galaxy", "Heavy airlift"),
+    "CARGO":  ("C-17A / C-5M", "Airlift"),
+    "HERK":   ("C-130J Super Hercules", "Tactical airlift"),
+    "HERKY":  ("C-130J Super Hercules", "Tactical airlift"),
+    # Tankers
+    "ETHYL":  ("KC-135 Stratotanker", "Aerial refueling"),
+    "JULIET": ("KC-10 Extender", "Aerial refueling"),
+    "PEARL":  ("KC-135 Stratotanker", "Aerial refueling"),
+    "STEEL":  ("KC-46A Pegasus", "Aerial refueling"),
+    "SHELL":  ("KC-135 Stratotanker", "Aerial refueling"),
+    "TEAL":   ("KC-135 Stratotanker", "Aerial refueling"),
+    "NKAC":   ("KC-135 Stratotanker", "Aerial refueling"),
+    "PKSN":   ("KC-46A Pegasus", "Aerial refueling"),
+    # Bombers
+    "DOOM":   ("B-2A Spirit", "Stealth bomber — HIGH SIGNIFICANCE"),
+    "DEATH":  ("B-52H Stratofortress", "Strategic bomber"),
+    "BATT":   ("B-52H Stratofortress", "Strategic bomber"),
+    "MYTEE":  ("B-52H Stratofortress", "Strategic bomber"),
+    "BONE":   ("B-1B Lancer", "Supersonic bomber"),
+    "LANCE":  ("B-1B Lancer", "Supersonic bomber"),
+    "TIGER":  ("B-1B Lancer", "Supersonic bomber"),
+    # ISR / SIGINT / AWACS
+    "HOMER":  ("P-8A Poseidon", "Maritime patrol / ASW"),
+    "TOPCT":  ("RC-135V/W Rivet Joint", "SIGINT collection"),
+    "JAKE":   ("E-3 Sentry (AWACS)", "Airborne early warning"),
+    "TITAN":  ("RQ-4B Global Hawk", "High-altitude ISR drone"),
+    "FORTE":  ("RQ-4B Global Hawk", "High-altitude ISR drone"),
+    "MAGIC":  ("E-6B Mercury", "Airborne command post — NUCLEAR C2"),
+    "SNTRY":  ("E-3 Sentry (AWACS)", "Airborne early warning"),
+    "REDEYE": ("RC-135U Combat Sent", "Electronic intelligence"),
+    "RAIDR":  ("MC-130J Commando II", "Special operations"),
+    "OLIVE":  ("RC-135S Cobra Ball", "Missile tracking"),
+    "MAZDA":  ("E-8C JSTARS", "Ground surveillance"),
+    # Fighters / Strike
+    "VIPER":  ("F-16 Fighting Falcon", "Multirole fighter"),
+    "EAGLE":  ("F-15E Strike Eagle", "Air superiority / strike"),
+    "HAWK":   ("F-15E Strike Eagle", "Air superiority"),
+    "RAZOR":  ("F-22A Raptor", "Air superiority — stealth"),
+    "STRIKE": ("F-15E Strike Eagle", "Strike fighter"),
+    "BOLT":   ("F-35A Lightning II", "Stealth multirole"),
+    "WRATH":  ("F-15E Strike Eagle", "Strike fighter"),
+    # CSAR / Medevac / Special Ops
+    "KING":   ("HC-130J Combat King II", "Combat search & rescue"),
+    "PEDRO":  ("HH-60W Jolly Green II", "Combat rescue helicopter"),
+    "JOLLY":  ("HH-60G Pave Hawk", "Combat rescue helicopter"),
+    "DUSTOFF":("UH-60 Black Hawk", "Medevac"),
+    "EVAC":   ("C-17A / C-130J", "Aeromedical evacuation"),
+    # VIP / Command
+    "SAM":    ("VC-25A / C-32A", "VIP transport — SENIOR LEADER"),
+    "VENUS":  ("C-37A Gulfstream V", "VIP transport"),
+    "EXEC":   ("C-37A / C-40B", "Executive transport"),
+    "SPAR":   ("C-40B Clipper", "Congressional / senior leader"),
+    # Navy / Marine
+    "NAVY":   ("P-8A / E-2D / C-2A", "Naval aviation"),
+    "HAVOC":  ("AH-1Z / MV-22", "Marine attack aviation"),
+    "CONDOR": ("C-40A Clipper", "Naval logistics"),
+    # UK RAF
+    "ASCOT":  ("C-17 / A400M / Voyager", "RAF transport / tanker"),
+    "RRR":    ("Voyager KC3 / A330 MRTT", "RAF aerial refueling"),
+    # NATO
+    "GAF":    ("A400M / A310", "German Air Force transport"),
+    "FAF":    ("A400M / MRTT", "French Air Force"),
+    "IAM":    ("C-130J / KC-767", "Italian Air Force"),
+}
+
+def identify_airframe(callsign):
+    """Return (airframe, role) tuple for a callsign, or None."""
+    cs = callsign.upper()
+    for prefix, info in CALLSIGN_AIRFRAMES.items():
+        if cs.startswith(prefix):
+            return info
+    return None
+
 # Polymarket event slugs for Iran-related markets
 POLYMARKET_IRAN_SLUGS = [
     "us-strikes-iran-by",
@@ -114,7 +197,149 @@ def get_opensky_token():
         return None
 
 
-def fetch_opensky():
+# ──────────────────────────────────────────────────────────────
+# LOCATION RESOLVER — converts lat/lon to plain English
+# ──────────────────────────────────────────────────────────────
+
+# Reference points: bases, cities, and landmarks
+_REFERENCE_POINTS = [
+    # US/Coalition bases
+    (25.117, 51.315, "Al Udeid AB, Qatar"),
+    (24.248, 54.547, "Al Dhafra AB, UAE"),
+    (29.346, 47.521, "Ali Al Salem AB, Kuwait"),
+    (32.356, 36.259, "Muwaffaq Salti AB, Jordan"),
+    (24.062, 47.580, "Prince Sultan AB, Saudi Arabia"),
+    (11.547, 43.155, "Camp Lemonnier, Djibouti"),
+    (37.002, 35.426, "Incirlik AB, Turkey"),
+    (34.590, 32.988, "RAF Akrotiri, Cyprus"),
+    (26.236, 50.577, "NSA Bahrain"),
+    (-7.313, 72.411, "Diego Garcia"),
+    # Key cities
+    (35.689, 51.389, "Tehran"),
+    (32.621, 51.678, "Isfahan"),
+    (32.064, 52.068, "Natanz"),
+    (34.861, 50.988, "Fordow"),
+    (27.188, 56.275, "Bandar Abbas"),
+    (33.313, 44.366, "Baghdad"),
+    (29.376, 47.978, "Kuwait City"),
+    (25.286, 51.533, "Doha"),
+    (24.454, 54.654, "Abu Dhabi"),
+    (25.204, 55.271, "Dubai"),
+    (23.486, 58.382, "Muscat"),
+    (21.485, 39.193, "Jeddah"),
+    (24.713, 46.675, "Riyadh"),
+    (38.963, 35.243, "Ankara"),
+    (31.768, 35.214, "Jerusalem"),
+    (32.084, 34.782, "Tel Aviv"),
+    (33.513, 36.292, "Damascus"),
+    (36.191, 44.009, "Kirkuk"),
+    (36.335, 43.119, "Mosul"),
+    (30.508, 47.783, "Basra"),
+    (15.370, 44.206, "Sana'a"),
+    (12.778, 45.019, "Aden"),
+]
+
+# Approximate country bounding boxes: (lat_min, lat_max, lon_min, lon_max, name)
+_COUNTRY_BOXES = [
+    (25, 40, 44, 63, "Iran"),
+    (29, 37.5, 39, 48.5, "Iraq"),
+    (16, 32, 35, 56, "Saudi Arabia"),
+    (22.5, 26.5, 51, 56.5, "UAE"),
+    (16, 26.5, 52, 60, "Oman"),
+    (28.5, 30.5, 46.5, 48.5, "Kuwait"),
+    (24.5, 26.5, 50.5, 52, "Qatar"),
+    (36, 42, 26, 45, "Turkey"),
+    (32, 37.5, 35.5, 42, "Syria"),
+    (29, 33.5, 35, 39, "Jordan"),
+    (29, 33.5, 34, 35.9, "Israel"),
+    (22, 31.5, 25, 37, "Egypt"),
+    (12, 19, 42, 54, "Yemen"),
+    (24, 37, 60, 75, "Pakistan"),
+    (29, 38.5, 60, 75, "Afghanistan"),
+    (34, 35.5, 32.5, 34.5, "Cyprus"),
+    (10, 12, 42, 44, "Djibouti"),
+    (-1, 12, 41, 51, "Somalia"),
+    (12, 18, 36, 43, "Eritrea"),
+]
+
+# Water bodies
+_WATER_BODIES = [
+    (26, 27.5, 49, 56, "the Persian Gulf"),
+    (24, 26.5, 56, 59, "the Gulf of Oman"),
+    (12, 24, 36, 50, "the Red Sea"),
+    (10, 20, 50, 60, "the Arabian Sea"),
+    (24, 30, 33, 35, "the eastern Mediterranean"),
+    (34, 37, 28, 36, "the eastern Mediterranean"),
+    (12, 30, 60, 75, "the Arabian Sea"),
+    (11, 13, 43, 48, "the Gulf of Aden"),
+    (25.5, 27, 56, 57, "the Strait of Hormuz"),
+]
+
+def _haversine_nm(lat1, lon1, lat2, lon2):
+    """Distance between two points in nautical miles."""
+    R = 3440.065  # Earth radius in nm
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def describe_location(lat, lon):
+    """Convert lat/lon to a human-readable location description."""
+    if lat is None or lon is None:
+        return "unknown location"
+
+    # 1. Check if near a known reference point (within 40nm / ~45 miles)
+    nearest_ref = None
+    nearest_dist = float('inf')
+    for rlat, rlon, rname in _REFERENCE_POINTS:
+        d = _haversine_nm(lat, lon, rlat, rlon)
+        if d < nearest_dist:
+            nearest_dist = d
+            nearest_ref = rname
+
+    if nearest_dist < 15:
+        return f"near {nearest_ref}"
+    elif nearest_dist < 40:
+        miles = round(nearest_dist * 1.151)
+        return f"~{miles} mi from {nearest_ref}"
+
+    # 2. Check if over water
+    for wlat_min, wlat_max, wlon_min, wlon_max, wname in _WATER_BODIES:
+        if wlat_min <= lat <= wlat_max and wlon_min <= lon <= wlon_max:
+            # Find nearest coast country for reference
+            nearest_country = None
+            nearest_cdist = float('inf')
+            for clat_min, clat_max, clon_min, clon_max, cname in _COUNTRY_BOXES:
+                # Distance to nearest edge of country box
+                clat = max(clat_min, min(lat, clat_max))
+                clon = max(clon_min, min(lon, clon_max))
+                cd = _haversine_nm(lat, lon, clat, clon)
+                if cd < nearest_cdist:
+                    nearest_cdist = cd
+                    nearest_country = cname
+            if nearest_country and nearest_cdist > 5:
+                miles = round(nearest_cdist * 1.151)
+                return f"over {wname}, ~{miles} mi off {nearest_country}"
+            return f"over {wname}"
+
+    # 3. Check which country it's over
+    for clat_min, clat_max, clon_min, clon_max, cname in _COUNTRY_BOXES:
+        if clat_min <= lat <= clat_max and clon_min <= lon <= clon_max:
+            # Add regional detail if near a known city
+            if nearest_dist < 100:
+                miles = round(nearest_dist * 1.151)
+                return f"over {cname}, ~{miles} mi from {nearest_ref}"
+            return f"over {cname}"
+
+    # 4. Fallback
+    if nearest_ref:
+        miles = round(nearest_dist * 1.151)
+        return f"~{miles} mi from {nearest_ref}"
+    return f"{lat}°N, {lon}°E"
+
+
+
     """Fetch military aircraft in the ME bounding box from OpenSky Network."""
     print("[OpenSky] Fetching aircraft data...")
     url = "https://opensky-network.org/api/states/all"
@@ -161,12 +386,18 @@ def fetch_opensky():
                     is_mil = True
 
             if is_mil and not on_ground:
+                r_lat = round(lat, 2) if lat else None
+                r_lon = round(lon, 2) if lon else None
+                airframe = identify_airframe(callsign)
                 mil_aircraft.append({
                     "callsign": callsign,
                     "origin": origin,
-                    "lat": round(lat, 2) if lat else None,
-                    "lon": round(lon, 2) if lon else None,
+                    "lat": r_lat,
+                    "lon": r_lon,
                     "alt_ft": round(alt_m * 3.281) if alt_m else None,
+                    "location_desc": describe_location(r_lat, r_lon) if r_lat and r_lon else "unknown",
+                    "airframe": airframe[0] if airframe else "Unknown type",
+                    "role": airframe[1] if airframe else "Military",
                 })
 
         print(f"[OpenSky] Total aircraft in ME box: {len(all_aircraft)}, "
@@ -202,7 +433,15 @@ def fetch_polymarket():
                 for ev in events:
                     for m in ev.get("markets", []):
                         q = (m.get("question") or "").lower()
-                        # Include any market mentioning Iran or related topics
+                        # Exclude sports, entertainment, non-conflict markets
+                        if any(ex in q for ex in [
+                            "world cup", "soccer", "football", "olympics", "fifa",
+                            "medal", "qualify", "championship", "tournament",
+                            "movie", "album", "grammy", "oscar", "box office",
+                            "gdp", "inflation", "interest rate", "bitcoin",
+                        ]):
+                            continue
+                        # Include markets about Iran conflict / military / nuclear
                         if any(kw in q for kw in [
                             "iran", "tehran", "khamenei", "irgc", "fordow", "natanz",
                             "strike", "centcom", "persian gulf", "strait of hormuz",
@@ -513,19 +752,52 @@ def generate_html(analysis, opensky, polymarket, metaculus, centcom):
           <div class="ag-body">{g['body']}</div>
         </div>"""
 
-    # Format military aircraft
-    mil_html = ""
-    for a in opensky.get("mil_aircraft", [])[:15]:
-        status_badge = ' <span style="color:var(--accent-cyan);font-size:10px;font-weight:600">★ NEW</span>' if a.get("status") == "new" else ' <span style="color:var(--text-muted);font-size:10px">returning</span>'
-        mil_html += f"""<tr>
-          <td class="aname">{a['callsign']}{status_badge}</td>
-          <td class="loc">{a.get('lat', '?')}°N, {a.get('lon', '?')}°E</td>
-          <td>{a.get('alt_ft', '?')} ft</td>
-          <td class="loc">{a.get('origin', '?')}</td>
-        </tr>"""
+    # Format military aircraft as concise prose summary (not a table)
+    mil_list = opensky.get("mil_aircraft", [])
+    new_ac = [a for a in mil_list if a.get("status") == "new"]
+    ret_ac = [a for a in mil_list if a.get("status") == "returning"]
 
-    if not mil_html:
-        mil_html = '<tr><td colspan="4" style="color:var(--text-muted)">No military aircraft with active transponders detected in this update. Note: most military flights do not broadcast ADS-B.</td></tr>'
+    if mil_list:
+        # Count by type
+        type_counts = {}
+        for a in mil_list:
+            cs = a["callsign"].upper()
+            if any(cs.startswith(p) for p in ["RCH","REACH","PACK","DUKE","MOOSE","FRED","CARGO","HERK"]):
+                t = "airlift"
+            elif any(cs.startswith(p) for p in ["ETHYL","JULIET","PEARL","STEEL","SHELL","TEAL"]):
+                t = "tanker"
+            elif any(cs.startswith(p) for p in ["HOMER","TOPCT","JAKE","TITAN","FORTE","MAGIC","SNTRY","REDEYE"]):
+                t = "ISR/AWACS"
+            elif any(cs.startswith(p) for p in ["DOOM","DEATH","BATT","MYTEE","BONE","VIPER","EAGLE","RAZOR"]):
+                t = "strike"
+            else:
+                t = "other military"
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        type_str = ", ".join(f"{v} {k}" for k, v in sorted(type_counts.items(), key=lambda x: -x[1]))
+
+        mil_html = f'<div style="font-size:13px;color:var(--text-secondary);line-height:1.7">'
+        mil_html += f'Detected <strong style="color:var(--text-primary)">{len(mil_list)}</strong> military aircraft broadcasting ADS-B across the Middle East region: {type_str}.'
+
+        if new_ac:
+            # Build location-aware descriptions of new aircraft with airframe IDs
+            new_descs = []
+            for a in new_ac[:6]:
+                loc = a.get("location_desc", "unknown")
+                airframe = a.get("airframe", "")
+                if airframe and airframe != "Unknown type":
+                    new_descs.append(f'{a["callsign"]} — {airframe} ({loc})')
+                else:
+                    new_descs.append(f'{a["callsign"]} ({loc})')
+            new_detail = "; ".join(new_descs)
+            more = f" and {len(new_ac) - 6} more" if len(new_ac) > 6 else ""
+            mil_html += f' Of these, <strong style="color:var(--accent-cyan)">{len(new_ac)} are new</strong> since the last scan: {new_detail}{more}.'
+        if ret_ac:
+            mil_html += f' {len(ret_ac)} were already present in yesterday\'s scan.'
+
+        mil_html += '</div>'
+    else:
+        mil_html = '<div style="font-size:13px;color:var(--text-muted);line-height:1.7">No military aircraft with active transponders detected in this scan. Most military flights do not broadcast ADS-B — absence of detections does not mean absence of activity.</div>'
 
     # Format CENTCOM releases
     centcom_html = ""
@@ -584,6 +856,9 @@ def generate_html(analysis, opensky, polymarket, metaculus, centcom):
             "alt_ft": a.get("alt_ft"),
             "origin": a.get("origin", ""),
             "status": a.get("status", "new"),
+            "location_desc": a.get("location_desc", ""),
+            "airframe": a.get("airframe", ""),
+            "role": a.get("role", ""),
         })
         if a.get("status") == "new":
             new_ac_count += 1
@@ -621,7 +896,7 @@ header{border-bottom:1px solid var(--border);padding:20px 32px;display:flex;alig
 .subtitle{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-muted);letter-spacing:2px;text-transform:uppercase}
 .ts{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-muted);text-align:right}
 .ts strong{color:var(--text-secondary);display:block}
-.wrap{max-width:1400px;margin:0 auto;padding:24px 32px}
+.wrap{max-width:960px;margin:0 auto;padding:24px 32px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px}
 .full{grid-column:1/-1}
 .sec{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:var(--text-muted);margin:32px 0 16px;padding-bottom:8px;border-bottom:1px solid var(--border)}
@@ -775,9 +1050,8 @@ table.pt{width:100%;border-collapse:collapse}
 <div class="card full" style="margin-bottom:28px">
   <div class="ch"><span class="ct">✈ Military Aircraft in ME Airspace</span><span class="badge ok">{{MIL_COUNT}} DETECTED / {{TOTAL_AIRCRAFT}} TOTAL</span></div>
   <div class="cb">
-    <table class="pt"><thead><tr><th>Callsign</th><th>Position</th><th>Altitude</th><th>Origin</th></tr></thead>
-    <tbody>{{MIL_AIRCRAFT_HTML}}</tbody></table>
-    <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">⚠ Most military aircraft fly without ADS-B transponders. This data represents only the fraction that broadcast. Absence of aircraft does not mean absence of activity.</div>
+    {{MIL_AIRCRAFT_HTML}}
+    <div style="margin-top:12px;font-size:11px;color:var(--text-muted)">⚠ Most military aircraft fly without ADS-B transponders. This represents only the fraction that broadcast.</div>
   </div>
   <div class="srcs"><span class="stag"><a href="https://opensky-network.org" target="_blank">OpenSky Network API</a></span><span class="stag">Free, rate-limited</span></div>
 </div>
@@ -876,7 +1150,7 @@ wrap.addEventListener('mousemove',e=>{
   const r=canvas.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let found=null;
   for(const ac of aircraft){if(Math.hypot(mx-toX(ac.lon),my-toY(ac.lat))<16){found=ac;break}}
   if(!found)for(const b of bases){if(Math.hypot(mx-toX(b.lon),my-toY(b.lat))<12){found={callsign:b.name,origin:'',alt_ft:null,status:'base'};break}}
-  if(found&&found!==hov){hov=found;const cat=found.status==='base'?{t:'US/Coalition Base',c:'#565e73'}:getCat(found.callsign);const st=found.status==='new'?'<span style="color:#40c8e8">★ NEW</span>':found.status==='returning'?'Still present':'';let h='<div style="font-weight:600;color:#40c8e8;font-size:12px">'+found.callsign+'</div>';if(found.origin)h+='<div style="color:#8b93a8;margin-top:2px;font-size:10px">'+found.origin+'</div>';if(found.alt_ft)h+='<div style="color:#8b93a8;font-size:10px">'+found.alt_ft.toLocaleString()+' ft</div>';h+='<div style="display:inline-block;padding:2px 6px;border-radius:2px;font-size:9px;margin-top:4px;background:'+cat.c+'20;color:'+cat.c+'">'+cat.t+'</div>';if(st)h+='<div style="margin-top:4px;font-size:9px">'+st+'</div>';tip.innerHTML=h;tip.style.left=(mx+16)+'px';tip.style.top=(my-10)+'px';tip.style.opacity='1'}else if(!found){hov=null;tip.style.opacity='0'}
+  if(found&&found!==hov){hov=found;const cat=found.status==='base'?{t:'US/Coalition Base',c:'#565e73'}:getCat(found.callsign);const st=found.status==='new'?'<span style="color:#40c8e8">★ NEW — not seen yesterday</span>':found.status==='returning'?'<span style="color:#565e73">Still present from yesterday</span>':'';let h='<div style="font-weight:600;color:#40c8e8;font-size:12px">'+found.callsign+'</div>';if(found.airframe)h+='<div style="color:#e8eaf0;margin-top:3px;font-size:11px;font-weight:500">'+found.airframe+'</div>';if(found.role)h+='<div style="color:#8b93a8;font-size:10px">'+found.role+'</div>';if(found.location_desc)h+='<div style="color:#8b93a8;margin-top:3px;font-size:10px">📍 '+found.location_desc+'</div>';if(found.alt_ft)h+='<div style="color:#565e73;font-size:10px">'+found.alt_ft.toLocaleString()+' ft · '+found.origin+'</div>';h+='<div style="display:inline-block;padding:2px 6px;border-radius:2px;font-size:9px;margin-top:5px;background:'+cat.c+'20;color:'+cat.c+'">'+cat.t+'</div>';if(st)h+='<div style="margin-top:4px;font-size:9px">'+st+'</div>';tip.innerHTML=h;tip.style.left=Math.min(mx+16,W-220)+'px';tip.style.top=(my-10)+'px';tip.style.opacity='1'}else if(!found){hov=null;tip.style.opacity='0'}
 });
 wrap.addEventListener('mouseleave',()=>{hov=null;tip.style.opacity='0'});
 })();
