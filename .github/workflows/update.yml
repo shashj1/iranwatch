@@ -29,7 +29,6 @@ jobs:
           OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
           OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
         run: python update.py
-
 - name: Commit and push if changed
         run: |
           git config user.name "Iran Watch Bot"
