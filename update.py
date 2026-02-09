@@ -508,13 +508,17 @@ def fetch_polymarket():
                         mkt = {"question": m.get("question",""), "probability": yes_price,
                             "volume": m.get("volume","0"), "url": f"https://polymarket.com/event/{ev.get('slug','')}",
                             "category": cat, "source": "polymarket"}
-                        vol = float(mkt.get("volume", 0))
-                        # Keep the highest-volume version of each dedup group
+                        # Dedup: keep the most informative version (prefer non-zero probability,
+                        # then highest probability — resolved/expired variants often show 0%)
                         if norm in seen_best:
-                            if vol > seen_best[norm][1]:
-                                seen_best[norm] = (mkt, vol)
+                            prev_mkt, prev_score = seen_best[norm]
+                            # Score: non-zero prob gets +1000 bonus, then by probability, then by volume
+                            curr_score = (1000 if yes_price > 0 else 0) + yes_price + float(mkt.get("volume", 0)) / 1e9
+                            if curr_score > prev_score:
+                                seen_best[norm] = (mkt, curr_score)
                         else:
-                            seen_best[norm] = (mkt, vol)
+                            score = (1000 if yes_price > 0 else 0) + yes_price + float(mkt.get("volume", 0)) / 1e9
+                            seen_best[norm] = (mkt, score)
             except Exception: pass
         # Assemble from dedup groups
         markets = [mkt for mkt, vol in seen_best.values()]
