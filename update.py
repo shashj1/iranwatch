@@ -77,7 +77,7 @@ MIL_PREFIXES = [
     # Other NATO / Coalition
     "GAF", "FAF", "IAM", "BAF", "DAF",
     # Generic military patterns
-    "GOLD", "SHADOW", "TORCH",
+    "GOLD", "SHADOW", "TORCH", "TABOR",
 ]
 
 # Callsign prefix → probable airframe and role
@@ -155,6 +155,12 @@ CALLSIGN_AIRFRAMES = {
     "GAF":    ("A400M / A310", "German Air Force transport"),
     "FAF":    ("A400M / MRTT", "French Air Force"),
     "IAM":    ("C-130J / KC-767", "Italian Air Force"),
+    # Additional tanker callsigns (from OSINT community)
+    "GOLD":   ("KC-46A Pegasus", "Aerial refueling"),
+    "TABOR":  ("F-35A Lightning II", "Stealth fighter deployment"),
+    "TREND":  ("F-15E Strike Eagle", "Strike fighter"),
+    "RAGE":   ("F-16 Fighting Falcon", "Multirole fighter"),
+    "IRON":   ("KC-135 Stratotanker", "Aerial refueling"),
 }
 
 def identify_airframe(callsign):
@@ -639,14 +645,21 @@ def _fetch_opensky_fallback():
 
 
 def fetch_polymarket():
-    """Fetch Iran-related prediction markets from Polymarket Gamma API."""
+    """Fetch Iran-related prediction markets from Polymarket Gamma API.
+    
+    Searches multiple relevant tags and keywords to capture both
+    Israel-Iran and US-Iran markets. Deduplicates aggressively to
+    avoid showing 5 versions of the same ceasefire question.
+    """
     print("[Polymarket] Fetching Iran markets...")
     url = "https://gamma-api.polymarket.com/events"
 
     try:
-        # Search by tag — cast a wide net
         markets = []
-        for tag in ["iran", "middle-east", "geopolitics"]:
+        seen_titles = set()  # For aggressive dedup
+        
+        # Search by tag — cast a wide net
+        for tag in ["iran", "middle-east", "geopolitics", "us-foreign-policy"]:
             try:
                 resp = requests.get(url, params={
                     "tag": tag, "active": "true", "closed": "false", "limit": 50
@@ -657,39 +670,68 @@ def fetch_polymarket():
                 for ev in events:
                     for m in ev.get("markets", []):
                         q = (m.get("question") or "").lower()
-                        # Exclude sports, entertainment, non-conflict markets
+                        # Exclude non-conflict topics
                         if any(ex in q for ex in [
                             "world cup", "soccer", "football", "olympics", "fifa",
                             "medal", "qualify", "championship", "tournament",
                             "movie", "album", "grammy", "oscar", "box office",
                             "gdp", "inflation", "interest rate", "bitcoin",
+                            "price", "stock", "etf", "crypto",
                         ]):
                             continue
                         # Include markets about Iran conflict / military / nuclear
                         if any(kw in q for kw in [
                             "iran", "tehran", "khamenei", "irgc", "fordow", "natanz",
                             "strike", "centcom", "persian gulf", "strait of hormuz",
-                            "arabian sea", "nuclear", "enrichment", "regime change"
+                            "arabian sea", "nuclear", "enrichment", "regime change",
+                            "us attack iran", "us strike iran", "bomb iran",
                         ]):
                             prices = json.loads(m.get("outcomePrices", "[]"))
                             yes_price = round(float(prices[0]) * 100) if prices else None
                             if yes_price is not None:
-                                mid = m.get("id", "")
-                                # Avoid duplicates
-                                if not any(x["question"] == m.get("question") for x in markets):
+                                # Aggressive dedup: normalize title for comparison
+                                norm_title = q.replace("?", "").strip()
+                                # Extract core question (remove date variants like "by march", "by april")
+                                dedup_key = norm_title
+                                for date_frag in ["by january", "by february", "by march", "by april",
+                                                   "by may", "by june", "by july", "by august",
+                                                   "by september", "by october", "by november", "by december",
+                                                   "in 2025", "in 2026", "before 2026", "before 2027",
+                                                   "by 2026", "by 2027"]:
+                                    dedup_key = dedup_key.replace(date_frag, "")
+                                dedup_key = dedup_key.strip()
+                                
+                                if dedup_key not in seen_titles:
+                                    seen_titles.add(dedup_key)
+                                    
+                                    # Categorise: US-strike vs Israel-strike vs ceasefire vs nuclear
+                                    category = "other"
+                                    if any(x in q for x in ["us strike", "us attack", "america strike", "united states strike", "us bomb"]):
+                                        category = "us_strike"
+                                    elif any(x in q for x in ["israel strike", "israel attack", "idf strike", "israeli strike"]):
+                                        category = "israel_strike"
+                                    elif any(x in q for x in ["ceasefire", "peace", "deal", "agreement", "negotiat"]):
+                                        category = "ceasefire"
+                                    elif any(x in q for x in ["nuclear", "enrichment", "weapon", "bomb", "warhead"]):
+                                        category = "nuclear"
+                                    elif any(x in q for x in ["war", "conflict", "military", "strike", "attack"]):
+                                        category = "conflict"
+                                    
                                     markets.append({
                                         "question": m.get("question", ""),
                                         "probability": yes_price,
                                         "volume": m.get("volume", "0"),
                                         "url": f"https://polymarket.com/event/{ev.get('slug', '')}",
+                                        "category": category,
                                     })
             except Exception:
                 pass  # Continue with next tag
 
-        # Sort by volume (most liquid markets first)
-        markets.sort(key=lambda x: float(x.get("volume", 0)), reverse=True)
+        # Sort: US-strike markets first, then Israel-strike, then by volume
+        category_order = {"us_strike": 0, "israel_strike": 1, "conflict": 2, "nuclear": 3, "ceasefire": 4, "other": 5}
+        markets.sort(key=lambda x: (category_order.get(x.get("category", "other"), 5), -float(x.get("volume", 0))))
 
-        print(f"[Polymarket] Found {len(markets)} Iran-related markets")
+        print(f"[Polymarket] Found {len(markets)} Iran-related markets (deduped)")
         return {"status": "ok", "markets": markets[:10]}
 
     except Exception as e:
@@ -698,44 +740,82 @@ def fetch_polymarket():
 
 
 def fetch_metaculus():
-    """Fetch Iran-related forecasting questions from Metaculus API."""
+    """Fetch Iran-related forecasting questions from Metaculus API.
+    
+    Strategy: Fetch specific known high-value question IDs PLUS search for
+    additional Iran questions. This ensures we never miss the key markets.
+    """
     print("[Metaculus] Fetching Iran questions...")
-
+    
+    # Known high-value question IDs — curated manually
+    KNOWN_QUESTION_IDS = [
+        41594,  # Will the US attack Iran before April 2026?
+        31498,  # Will Israel attack Iran's nuclear facilities before 2026?
+        31327,  # Will Iran test a nuclear weapon before 2030?
+        32764,  # Will Iran enrich uranium to 90% before 2027?
+    ]
+    
+    questions = []
+    headers = {"Accept": "application/json", "User-Agent": "IranWatch/1.0"}
+    
     try:
-        # Try the v2 API first, fall back to legacy
-        resp = requests.get(
-            "https://www.metaculus.com/api2/questions/",
-            params={"search": "iran", "status": "open", "limit": 20, "type": "binary",
-                    "order_by": "-activity"},
-            timeout=15,
-            headers={"Accept": "application/json"},
-        )
-        if resp.status_code == 404:
-            # Try alternative endpoint
-            resp = requests.get(
-                "https://www.metaculus.com/api/questions/",
-                params={"search": "iran", "status": "open", "limit": 20},
-                timeout=15,
-                headers={"Accept": "application/json"},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-
-        questions = []
-        for q in data.get("results", []):
-            title = (q.get("title") or "").lower()
-            if "iran" in title:
-                cp = q.get("community_prediction", {})
-                full = cp.get("full", {}) if isinstance(cp, dict) else {}
-                median = full.get("q2") if isinstance(full, dict) else None
-                if median is not None:
-                    questions.append({
-                        "question": q.get("title", ""),
-                        "probability": round(median * 100),
-                        "forecasters": q.get("number_of_predictions", 0),
-                        "url": q.get("url", ""),
-                    })
-
+        # 1. Fetch specific known questions by ID
+        for qid in KNOWN_QUESTION_IDS:
+            try:
+                resp = requests.get(
+                    f"https://www.metaculus.com/api2/questions/{qid}/",
+                    timeout=10, headers=headers,
+                )
+                if resp.status_code == 200:
+                    q = resp.json()
+                    cp = q.get("community_prediction", {})
+                    full = cp.get("full", {}) if isinstance(cp, dict) else {}
+                    median = full.get("q2") if isinstance(full, dict) else None
+                    status = q.get("status", "")
+                    if median is not None and status in ("open", "upcoming", ""):
+                        questions.append({
+                            "question": q.get("title", ""),
+                            "probability": round(median * 100),
+                            "forecasters": q.get("number_of_predictions", q.get("nr_forecasters", 0)),
+                            "url": f"https://www.metaculus.com/questions/{qid}/",
+                            "id": qid,
+                        })
+                        print(f"  [Metaculus] Fetched Q{qid}: {q.get('title', '')[:50]}... → {round(median*100)}%")
+            except Exception as e:
+                print(f"  [Metaculus] Error fetching Q{qid}: {e}")
+        
+        # 2. Search for additional Iran questions
+        for search_term in ["iran strike", "iran nuclear", "iran attack", "iran war"]:
+            try:
+                resp = requests.get(
+                    "https://www.metaculus.com/api2/questions/",
+                    params={"search": search_term, "status": "open", "limit": 10,
+                            "type": "binary", "order_by": "-activity"},
+                    timeout=15, headers=headers,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for q in data.get("results", []):
+                        title = (q.get("title") or "").lower()
+                        qid = q.get("id")
+                        # Skip if already fetched
+                        if any(x.get("id") == qid for x in questions):
+                            continue
+                        if any(kw in title for kw in ["iran", "tehran", "irgc", "natanz", "fordow"]):
+                            cp = q.get("community_prediction", {})
+                            full = cp.get("full", {}) if isinstance(cp, dict) else {}
+                            median = full.get("q2") if isinstance(full, dict) else None
+                            if median is not None:
+                                questions.append({
+                                    "question": q.get("title", ""),
+                                    "probability": round(median * 100),
+                                    "forecasters": q.get("number_of_predictions", q.get("nr_forecasters", 0)),
+                                    "url": f"https://www.metaculus.com/questions/{qid}/",
+                                    "id": qid,
+                                })
+            except Exception:
+                pass
+        
         print(f"[Metaculus] Found {len(questions)} Iran-related questions")
         return {"status": "ok", "questions": questions[:10]}
 
@@ -815,12 +895,23 @@ Recent releases: {json.dumps(centcom.get('releases', []), indent=2)}
 
     system_prompt = """You are an intelligence analyst producing a daily open-source intelligence (OSINT) briefing on the US military posture toward Iran. Write in IC (Intelligence Community) style with confidence levels.
 
+CRITICAL: CONTEXTUALISE MILITARY MOVEMENTS
+Do NOT treat all military aircraft movements as Iran-related. Apply Occam's Razor:
+- Tanker movements from European bases (Morón, Rota, Ramstein, Lakenheath) may support routine deployments, exercises, or non-Iran missions (e.g. NATO ops, diplomatic visits, training rotations).
+- VIP transport aircraft near the Caucasus/Turkey may relate to diplomatic travel (e.g. VP/SecState visits to regional capitals).
+- Fighter deployments from CONUS may be routine rotational replacements, not surge indicators.
+- C-17 airlift near Gulf bases is continuous and not inherently escalatory.
+Only flag movements as Iran-significant if they match I&W patterns: unusual tanker surges, bomber repositioning, ISR orbit changes, SEAD/DEAD package assembly, or carrier strike group movements.
+When in doubt, note the movement factually and state it's "consistent with routine operations" or "could support multiple missions" rather than implying escalation.
+
 CRITICAL INSTRUCTION FOR AIRCRAFT DATA:
 Each aircraft in the data includes pre-computed fields:
 - "airframe": The probable aircraft type (e.g., "C-17A Globemaster III", "RQ-4B Global Hawk")
 - "role": The aircraft's mission role (e.g., "Strategic airlift", "High-altitude ISR drone")
 - "location_desc": A human-readable location (e.g., "near Al Udeid AB, Qatar", "over the Persian Gulf")
 - "origin": Country of origin (e.g., "United States", "United Kingdom")
+- "registration": Tail number (when available from airplanes.live)
+- "hex": ICAO24 transponder address
 
 When describing aircraft detections, write in plain conversational English. Describe what the aircraft ARE and WHERE they are — not callsigns or tail numbers. Group similar aircraft together. Examples of good style:
 - "We can see a British C-17 transport near Kirkuk and a Voyager refuelling aircraft over Iraq."
@@ -833,14 +924,14 @@ Do NOT include callsigns (like RCH4521) or raw coordinates in your prose. Keep i
 Your output must be a JSON object with exactly these keys:
 {
   "threat_level": "HIGH" or "CRITICAL" or "ELEVATED" or "ROUTINE",
-  "threat_summary": "2-3 sentence summary explaining the threat level. Mention notable aircraft types if significant (e.g. bombers, surveillance drones, tanker surges).",
+  "threat_summary": "2-3 sentence summary explaining the threat level. Mention notable aircraft types if significant (e.g. bombers, surveillance drones, tanker surges). Note any benign explanations for movements (exercises, diplomatic travel, rotations).",
   "key_judgment": "IC-style key judgment paragraph with confidence level",
-  "overnight_summary": "2-3 sentences: what changed in the last 24 hours — cover force posture and diplomatic developments. Describe aircraft in plain English.",
+  "overnight_summary": "2-3 sentences: what changed in the last 24 hours — cover force posture and diplomatic developments. Describe aircraft in plain English. Note any VIP travel or diplomatic events that may explain military movements.",
   "activity_groups": [
-    {"title": "Group Title", "icon": "critical|notable|routine", "body": "Summary with [Source] tags. Describe aircraft plainly."}
+    {"title": "Group Title", "icon": "critical|notable|routine", "body": "Summary with [Source] tags. Describe aircraft plainly. Where movements have benign explanations, note them."}
   ],
-  "prediction_markets_summary": "2-3 sentence summary of what prediction markets are saying",
-  "diplomatic_summary": "2-3 bullet points on diplomatic situation",
+  "prediction_markets_summary": "2-3 sentence summary of prediction markets. CRITICAL: State clearly whether probabilities have RISEN or FALLEN in recent days/weeks and by how much. If volume data is available, note whether betting activity has increased. Distinguish between US-strike and Israel-strike markets.",
+  "diplomatic_summary": "2-3 bullet points on diplomatic situation. Include any scheduled VIP travel, negotiations, or diplomatic signals that provide context for military movements.",
   "iw_updates": "Any updates to I&W indicators based on new data"
 }
 
@@ -963,13 +1054,24 @@ def generate_html(analysis, opensky, polymarket, metaculus, centcom):
         vol = float(m.get("volume", 0))
         vol_str = f"${vol/1e6:.0f}M" if vol >= 1e6 else f"${vol/1e3:.0f}K" if vol >= 1e3 else f"${vol:.0f}"
 
+        # Category badge
+        cat = m.get("category", "other")
+        cat_badges = {
+            "us_strike": ("US STRIKE", "var(--accent-red)"),
+            "israel_strike": ("ISRAEL STRIKE", "var(--accent-amber)"),
+            "conflict": ("CONFLICT", "var(--accent-amber)"),
+            "nuclear": ("NUCLEAR", "var(--accent-red)"),
+            "ceasefire": ("DIPLOMATIC", "var(--accent-cyan)"),
+        }
+        cat_label, cat_col = cat_badges.get(cat, ("", ""))
+        cat_html = f'<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:{cat_col}15;color:{cat_col};margin-right:6px;font-weight:600">{cat_label}</span>' if cat_label else ""
+
         # Delta badge
         delta = m.get("prob_delta")
         delta_html = ""
         if delta is not None and delta != 0:
             arrow = "▲" if delta > 0 else "▼"
             dcol = "var(--accent-red)" if delta > 0 else "var(--accent-green)" if delta < 0 else "var(--text-muted)"
-            # Highlight big moves
             if abs(delta) >= 5:
                 delta_html = f'<span style="color:{dcol};font-weight:600;font-size:12px;margin-left:8px">{arrow}{abs(delta)}pts</span>'
             else:
@@ -985,18 +1087,20 @@ def generate_html(analysis, opensky, polymarket, metaculus, centcom):
         elif vol_ratio and vol_ratio >= 2.0:
             vol_badge = f' · <span style="color:var(--accent-amber)">{vol_ratio}x vol</span>'
 
+        mkt_url = m.get("url", "#")
         markets_html += f"""
         <div class="mrow">
-          <div class="mq">{m['question']}<span class="mplat">Polymarket · Vol: {vol_str}{vol_badge}</span></div>
+          <div class="mq">{cat_html}<a href="{mkt_url}" target="_blank" style="color:inherit;text-decoration:none">{m['question']}</a><span class="mplat">Polymarket · Vol: {vol_str}{vol_badge}</span></div>
           <div class="mprob" style="color:{col}">{prob}%{delta_html}</div>
         </div>"""
 
     for q in metaculus.get("questions", []):
         prob = q["probability"]
         col = "var(--accent-red)" if prob >= 60 else "var(--accent-amber)" if prob >= 40 else "var(--text-secondary)"
+        m_url = q.get("url", "#")
         markets_html += f"""
         <div class="mrow">
-          <div class="mq">{q['question']}<span class="mplat">Metaculus · {q.get('forecasters', '?')} forecasters</span></div>
+          <div class="mq"><a href="{m_url}" target="_blank" style="color:inherit;text-decoration:none">{q['question']}</a><span class="mplat">Metaculus · {q.get('forecasters', '?')} forecasters</span></div>
           <div class="mprob" style="color:{col}">{prob}%</div>
         </div>"""
 
